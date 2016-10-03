@@ -57,6 +57,8 @@ type dialer struct {
 
 	consecSuccesses int32
 	consecFailures  int32
+
+	stats *stats
 }
 
 const longDuration = 100000 * time.Hour
@@ -68,9 +70,7 @@ func (d *dialer) Start() {
 	d.emaDialTime = newEMADuration(0, 0.5)
 	d.closeCh = make(chan struct{})
 	d.checkTimer = time.NewTimer(longDuration)
-	if d.Check == nil {
-		d.Check = d.defaultCheck
-	}
+	d.stats = &stats{}
 
 	ops.Go(func() {
 		for {
@@ -89,6 +89,11 @@ func (d *dialer) Start() {
 }
 
 func (d *dialer) check() {
+	if d.Check == nil {
+		log.Errorf("No check function provided for dialer %s, not checking", d.Label)
+		return
+	}
+
 	log.Debugf("Start checking dialer %s", d.Label)
 	t := time.Now()
 	ok := d.Check()
@@ -134,6 +139,8 @@ func (d *dialer) dial(network, addr string) (net.Conn, error) {
 }
 
 func (d *dialer) markSuccess() {
+	atomic.AddInt64(&d.stats.attempts, 1)
+	atomic.AddInt64(&d.stats.successes, 1)
 	newCS := atomic.AddInt32(&d.consecSuccesses, 1)
 	log.Tracef("Dialer %s consecutive successes: %d -> %d", d.Label, newCS-1, newCS)
 	// only when state is changing
@@ -143,6 +150,8 @@ func (d *dialer) markSuccess() {
 }
 
 func (d *dialer) markFailure() {
+	atomic.AddInt64(&d.stats.attempts, 1)
+	atomic.AddInt64(&d.stats.failures, 1)
 	newCF := atomic.AddInt32(&d.consecFailures, 1)
 	log.Tracef("Dialer %s consecutive failures: %d -> %d", d.Label, newCF-1, newCF)
 	// Don't bother to recheck if dialer is constantly failing.
@@ -155,11 +164,6 @@ func (d *dialer) markFailure() {
 		d.checkTimer.Reset(nextCheck)
 		d.muCheckTimer.Unlock()
 	}
-}
-
-func (d *dialer) defaultCheck() bool {
-	log.Errorf("No check function provided for dialer %s", d.Label)
-	return true
 }
 
 // adds randomization to make requests less distinguishable on the network.

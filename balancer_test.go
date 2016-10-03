@@ -47,6 +47,12 @@ func TestSingleDialer(t *testing.T) {
 		doTestConn(t, conn)
 	}
 
+	if assert.Len(t, b.dialers.dialers, 1) {
+		assert.EqualValues(t, 1, b.dialers.dialers[0].stats.attempts)
+		assert.EqualValues(t, 1, b.dialers.dialers[0].stats.successes)
+		assert.EqualValues(t, 0, b.dialers.dialers[0].stats.failures)
+	}
+
 	// Test close balancer
 	b.Close()
 	time.Sleep(250 * time.Millisecond)

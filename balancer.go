@@ -41,14 +41,16 @@ type Balancer struct {
 	mu           sync.RWMutex
 	dialers      dialerHeap
 	trusted      dialerHeap
+	stopStats    chan bool
 }
 
 // New creates a new Balancer using the supplied Strategy and Dialers.
 func New(st Strategy, dialers ...*Dialer) *Balancer {
 	// a small alpha to gradually adjust timeout based on performance of all
 	// dialers
-	b := &Balancer{st: st, nextTimeout: newEMADuration(initialTimeout, 0.2)}
+	b := &Balancer{st: st, nextTimeout: newEMADuration(initialTimeout, 0.2), stopStats: make(chan bool, 0)}
 	b.Reset(dialers...)
+	go b.printStats()
 	return b
 }
 
@@ -177,6 +179,7 @@ func (b *Balancer) dialWithTimeout(d *dialer, network, addr string) (net.Conn, e
 // Close closes this Balancer, stopping all background processing. You must call
 // Close to avoid leaking goroutines.
 func (b *Balancer) Close() {
+	b.stopStats <- true
 	b.mu.Lock()
 	oldDialers := b.dialers
 	b.dialers.dialers = nil
@@ -212,6 +215,21 @@ func (b *Balancer) pickDialer(trustedOnly bool) (*dialer, error) {
 	d := heap.Pop(dialers).(*dialer)
 	heap.Push(dialers, d)
 	return d, nil
+}
+
+// printStats periodically prints out stats for all dialers
+func (b *Balancer) printStats() {
+	t := time.NewTicker(30 * time.Second)
+	for {
+		select {
+		case <-b.stopStats:
+			return
+		case <-t.C:
+			for _, d := range b.dialers.dialers {
+				log.Debug(d.stats.String(d))
+			}
+		}
+	}
 }
 
 type dialerHeap struct {

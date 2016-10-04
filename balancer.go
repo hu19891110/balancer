@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/errors"
@@ -21,36 +21,78 @@ const (
 
 	// reasonable but slightly larger than the timeout of all dialers
 	initialTimeout = 1 * time.Minute
+
+	defaultMinCheckInterval = 10 * time.Second
+	defaultMaxCheckInterval = 1 * time.Hour
 )
 
 var (
-	// When Dial() is called after an idle period larger than
-	// recheckAfterIdleFor, Balancer will recheck all dialers to make sure they
-	// are alive and have up-to-date metrics.
-	recheckAfterIdleFor = 1 * time.Minute
-
 	log = golog.LoggerFor("balancer")
 )
 
+// Opts are options for the balancer.
+type Opts struct {
+	// Strategy is the strategy to be used for load balancing between the dialers.
+	Strategy Strategy
+
+	// Dialers are the Dialers amongst which the Balancer will balance.
+	Dialers []*Dialer
+
+	// CheckData returns data to be used by each dialer's Check function on a
+	// given checking pass.
+	CheckData func() interface{}
+
+	// MinCheckInterval controls the minimum check interval when scheduling dialer
+	// checks. Defaults to 10 seconds.
+	MinCheckInterval time.Duration
+
+	// MaxCheckInterval controls the maximum check interval when scheduling dialer
+	// checks. Defaults to 1 minute.
+	MaxCheckInterval time.Duration
+}
+
 // Balancer balances connections among multiple Dialers.
 type Balancer struct {
-	// make sure to align on 64bit boundary
-	lastDialTime int64 // Time.UnixNano()
-	nextTimeout  *emaDuration
-	st           Strategy
-	mu           sync.RWMutex
-	dialers      dialerHeap
-	trusted      dialerHeap
-	stopStats    chan bool
+	lastDialTime     int64 // not used anymore, but makes sure we're aligned on 64bit boundary
+	nextTimeout      *emaDuration
+	st               Strategy
+	mu               sync.RWMutex
+	dialers          dialerHeap
+	trusted          dialerHeap
+	checkData        func() interface{}
+	minCheckInterval time.Duration
+	maxCheckInterval time.Duration
+	resetCheckCh     chan bool
+	closeCh          chan bool
+	stopStats        chan bool
 }
 
 // New creates a new Balancer using the supplied Strategy and Dialers.
-func New(st Strategy, dialers ...*Dialer) *Balancer {
+func New(opts *Opts) *Balancer {
 	// a small alpha to gradually adjust timeout based on performance of all
 	// dialers
-	b := &Balancer{st: st, nextTimeout: newEMADuration(initialTimeout, 0.2), stopStats: make(chan bool, 0)}
-	b.Reset(dialers...)
-	go b.printStats()
+	b := &Balancer{
+		st:               opts.Strategy,
+		nextTimeout:      newEMADuration(initialTimeout, 0.2),
+		checkData:        opts.CheckData,
+		minCheckInterval: opts.MinCheckInterval,
+		maxCheckInterval: opts.MaxCheckInterval,
+		resetCheckCh:     make(chan bool, 1),
+		closeCh:          make(chan bool, 1),
+		stopStats:        make(chan bool, 0),
+	}
+	if b.checkData == nil {
+		b.checkData = func() interface{} { return nil }
+	}
+	if b.minCheckInterval <= 0 {
+		b.minCheckInterval = defaultMinCheckInterval
+	}
+	if b.maxCheckInterval <= 0 {
+		b.maxCheckInterval = defaultMaxCheckInterval
+	}
+	b.Reset(opts.Dialers...)
+	ops.Go(b.runChecks)
+	ops.Go(b.printStats)
 	return b
 }
 
@@ -60,7 +102,7 @@ func (b *Balancer) Reset(dialers ...*Dialer) {
 	var tdls []*dialer
 
 	for _, d := range dialers {
-		dl := &dialer{Dialer: d}
+		dl := &dialer{Dialer: d, forceRecheck: b.forceRecheck}
 		dl.Start()
 		dls = append(dls, dl)
 
@@ -78,6 +120,7 @@ func (b *Balancer) Reset(dialers ...*Dialer) {
 	for _, d := range oldDialers.dialers {
 		d.Stop()
 	}
+	b.forceRecheck()
 }
 
 // OnRequest calls Dialer.OnRequest for every dialer in this balancer.
@@ -95,14 +138,6 @@ func (b *Balancer) OnRequest(req *http.Request) {
 // either manages to connect, or runs out of dialers in which case it returns an
 // error.
 func (b *Balancer) Dial(network, addr string) (net.Conn, error) {
-	now := time.Now()
-	lastDialTime := time.Unix(0, atomic.SwapInt64(&b.lastDialTime, now.UnixNano()))
-	idlePeriod := now.Sub(lastDialTime)
-	if idlePeriod > recheckAfterIdleFor {
-		log.Debugf("Balancer idle for %s, start checking all dialers", idlePeriod)
-		b.checkDialers()
-	}
-
 	trustedOnly := false
 	_, port, _ := net.SplitHostPort(addr)
 	// We try to identify HTTP traffic (as opposed to HTTPS) by port and only
@@ -129,7 +164,9 @@ func (b *Balancer) Dial(network, addr string) (net.Conn, error) {
 			log.Error(errors.New("Unable to dial via %v to %s://%s: %v on pass %v...continuing", d.Label, network, addr, err, i))
 			continue
 		}
-		log.Tracef("Successfully dialed via %v to %v://%v on pass %v", d.Label, network, addr, i)
+		// Please leave this at Debug level, as it helps us understand performance
+		// issues caused by a poor proxy being selected.
+		log.Debugf("Successfully dialed via %v to %v://%v on pass %v", d.Label, network, addr, i)
 		return conn, nil
 	}
 	return nil, fmt.Errorf("Still unable to dial %s://%s after %d attempts", network, addr, dialAttempts)
@@ -179,23 +216,12 @@ func (b *Balancer) dialWithTimeout(d *dialer, network, addr string) (net.Conn, e
 // Close closes this Balancer, stopping all background processing. You must call
 // Close to avoid leaking goroutines.
 func (b *Balancer) Close() {
-	b.stopStats <- true
-	b.mu.Lock()
-	oldDialers := b.dialers
-	b.dialers.dialers = nil
-	b.mu.Unlock()
-	for _, d := range oldDialers.dialers {
-		d.Stop()
+	select {
+	case b.closeCh <- true:
+		// Submitted close request
+	default:
+		// already closing
 	}
-}
-
-// Parallel check all dialers
-func (b *Balancer) checkDialers() {
-	b.mu.RLock()
-	for _, d := range b.dialers.dialers {
-		go d.check()
-	}
-	b.mu.RUnlock()
 }
 
 func (b *Balancer) pickDialer(trustedOnly bool) (*dialer, error) {
@@ -225,7 +251,12 @@ func (b *Balancer) printStats() {
 		case <-b.stopStats:
 			return
 		case <-t.C:
-			for _, d := range b.dialers.dialers {
+			b.mu.RLock()
+			sortedDialers := make(byLatency, len(b.dialers.dialers))
+			copy(sortedDialers, b.dialers.dialers)
+			b.mu.RUnlock()
+			sort.Sort(sortedDialers)
+			for _, d := range sortedDialers {
 				log.Debug(d.stats.String(d))
 			}
 		}
@@ -266,4 +297,14 @@ func (s *dialerHeap) onRequest(req *http.Request) {
 		}
 	}
 	return
+}
+
+type byLatency []*dialer
+
+func (d byLatency) Len() int { return len(d) }
+
+func (d byLatency) Swap(i, j int) { d[i], d[j] = d[j], d[i] }
+
+func (d byLatency) Less(i, j int) bool {
+	return d[i].EMALatency() < d[j].EMALatency()
 }

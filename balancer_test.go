@@ -20,13 +20,12 @@ var (
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	nextCheckFactor = 100 * time.Millisecond
 }
 
 func TestNoDialers(t *testing.T) {
 	addr, l := echoServer()
 	defer func() { _ = l.Close() }()
-	b := New(Sticky)
+	b := newBalancer(Sticky)
 	_, err := b.Dial("tcp", addr)
 	assert.Error(t, err, "Dialing with no dialers should have failed")
 }
@@ -41,7 +40,7 @@ func TestSingleDialer(t *testing.T) {
 		atomic.StoreInt32(&dialerClosed, 1)
 	}
 	// Test successful single dialer
-	b := New(Sticky, dialer)
+	b := newBalancer(Sticky, dialer)
 	conn, err := b.Dial("tcp", addr)
 	if assert.NoError(t, err, "Dialing should have succeeded") {
 		doTestConn(t, conn)
@@ -72,7 +71,7 @@ func TestRetryOnBadDialer(t *testing.T) {
 	d2Attempts := int32(0)
 	dialer2 := newCondDialer(2, func() bool { atomic.AddInt32(&d2Attempts, 1); return true })
 
-	b := New(Sticky, dialer1)
+	b := newBalancer(Sticky, dialer1)
 	_, err := b.Dial("tcp", addr)
 	if assert.Error(t, err, "Dialing bad dialer should fail") {
 		assert.EqualValues(t, 1, atomic.LoadInt32(&d1Attempts), "should try same dialer only once")
@@ -107,7 +106,7 @@ func TestRandomDialer(t *testing.T) {
 		return false
 	})
 
-	b := New(Random, dialer1, dialer2, dialer3)
+	b := newBalancer(Random, dialer1, dialer2, dialer3)
 	defer b.Close()
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
@@ -138,7 +137,7 @@ func TestSuccessWithCondDialer(t *testing.T) {
 	dialer3 := newDialer(3)
 
 	// Test success with failing dialer
-	b := New(Sticky, dialer1, dialer2, dialer3)
+	b := newBalancer(Sticky, dialer1, dialer2, dialer3)
 	defer b.Close()
 	conn, err := b.Dial("tcp", addr)
 	if assert.NoError(t, err, "Dialing should have succeeded") {
@@ -152,7 +151,7 @@ func TestRecheck(t *testing.T) {
 	attempts := int32(0)
 	dialer := newCondDialer(1, func() bool { return atomic.AddInt32(&attempts, 1) <= 1 })
 	// Test failure
-	b := New(Sticky, dialer, dialer)
+	b := newBalancer(Sticky, dialer, dialer)
 	_, err := b.Dial("tcp", addr)
 	assert.NoError(t, err, "Dialing should have succeeded as we have 2nd try")
 	assert.EqualValues(t, 2, atomic.LoadInt32(&attempts), "Wrong number of dial attempts on failed dialer")
@@ -173,72 +172,46 @@ func TestTrusted(t *testing.T) {
 		},
 	}
 
-	_, err := New(Sticky, dialer).Dial("tcp", "does-not-exist.com:80")
+	_, err := newBalancer(Sticky, dialer).Dial("tcp", "does-not-exist.com:80")
 	assert.Error(t, err, "Dialing with no trusted dialers should have failed")
 	assert.Equal(t, dialCount, 0, "should not dial untrusted dialer")
 
-	_, err = New(Sticky, dialer).Dial("tcp", "does-not-exist.com:8080")
+	_, err = newBalancer(Sticky, dialer).Dial("tcp", "does-not-exist.com:8080")
 	assert.Error(t, err, "Dialing with no trusted dialers should have failed")
 	assert.Equal(t, dialCount, 0, "should not dial untrusted dialer")
 
 	dialer.Trusted = true
-	_, err = New(Sticky, dialer).Dial("tcp", "does-not-exist.com:80")
+	_, err = newBalancer(Sticky, dialer).Dial("tcp", "does-not-exist.com:80")
 	assert.NoError(t, err, "Dialing with trusted dialer should have succeeded")
 	assert.Equal(t, dialCount, 1, "should dial untrusted dialer")
-	_, err = New(Sticky, dialer).Dial("tcp", "does-not-exist.com:8080")
+	_, err = newBalancer(Sticky, dialer).Dial("tcp", "does-not-exist.com:8080")
 	assert.NoError(t, err, "Dialing with trusted dialer should have succeeded")
 	assert.Equal(t, dialCount, 2, "should dial untrusted dialer")
 }
 
 func TestCheck(t *testing.T) {
-	oldrecheckAfterIdleFor := recheckAfterIdleFor
-	recheckAfterIdleFor = 100 * time.Millisecond
-	defer func() { recheckAfterIdleFor = oldrecheckAfterIdleFor }()
-
-	var wg sync.WaitGroup
-	var failToDial uint32
+	minCheckInterval := 50 * time.Millisecond
 	var checkCount uint32
 	d := &Dialer{
 		DialFN: func(network, addr string) (net.Conn, error) {
-			if atomic.LoadUint32(&failToDial) == 1 {
-				return nil, fmt.Errorf("fail intentionally")
-			}
 			return nil, nil
 		},
-		Check: func() bool {
+		Check: func(checkData interface{}) (bool, time.Duration) {
 			newCount := atomic.AddUint32(&checkCount, 1)
 			log.Debugf("Check() called %d times", newCount)
-			wg.Done()
-			return true
+			return true, 1 * time.Second
 		},
 		Trusted: true,
 	}
-	bal := New(Sticky, d)
+	New(&Opts{
+		Strategy:         Sticky,
+		Dialers:          []*Dialer{d},
+		MinCheckInterval: minCheckInterval,
+		MaxCheckInterval: minCheckInterval,
+	})
 
-	// check when dial for the first time
-	wg.Add(1)
-	_, err := bal.Dial("tcp", "check-first-time:80")
-	assert.NoError(t, err)
-	wg.Wait()
-
-	// recheck when dial after idled for a while
-	wg.Add(1)
-	time.Sleep(200 * time.Millisecond)
-	_, err = bal.Dial("tcp", "check-after-idle:80")
-	assert.NoError(t, err)
-	wg.Wait()
-
-	// not recheck with consecutive successes
-	_, err = bal.Dial("tcp", "not-check-for-consec-successes:80")
-	assert.NoError(t, err)
-
-	// recheck failed dialer
-	wg.Add(1)
-	atomic.StoreUint32(&failToDial, 1)
-	_, err = bal.Dial("tcp", "check-failed-dialer:80")
-	assert.Error(t, err)
-	time.Sleep(100 * time.Millisecond)
-	wg.Wait()
+	time.Sleep(minCheckInterval * 2)
+	assert.True(t, atomic.LoadUint32(&checkCount) >= 2)
 }
 
 func TestResetDailers(t *testing.T) {
@@ -258,7 +231,7 @@ func TestResetDailers(t *testing.T) {
 		atomic.AddInt32(&good, 1)
 		return false
 	})
-	b := New(Sticky, badDialer)
+	b := newBalancer(Sticky, badDialer)
 	go func() {
 		<-chReset
 		b.Reset(goodDialer)
@@ -268,44 +241,6 @@ func TestResetDailers(t *testing.T) {
 	assert.NoError(t, err, "Should have no error dialing with resetted balancer")
 	assert.Equal(t, int32(1), atomic.LoadInt32(&bad), "should dial bad dialer only once")
 	assert.Equal(t, int32(1), atomic.LoadInt32(&good), "should dial good dialer only once")
-}
-
-func TestDynamicTimeout(t *testing.T) {
-	addr, l := echoServer()
-	defer func() { _ = l.Close() }()
-
-	var slowAttempts int32
-	slow := newLatencyDialer(1, 10*time.Millisecond, time.Millisecond, &slowAttempts)
-	var fastAttempts int32
-	var fastSleepFor int64
-	fast := newCondDialer(2, func() bool {
-		if sleep := atomic.LoadInt64(&fastSleepFor); sleep > 0 {
-			time.Sleep(time.Duration(sleep))
-		}
-		atomic.AddInt32(&fastAttempts, 1)
-		return false
-	})
-
-	bal := New(QualityFirst, slow, fast)
-	for i := 0; i < 20; i++ {
-		_, err := bal.Dial("tcp", addr)
-		assert.NoError(t, err, fmt.Sprintf("Dialing should have succeeded in round %d", i))
-	}
-	assert.True(t, bal.nextTimeout.Get() < time.Second)
-	assertWithinRangeOf(t, atomic.LoadInt32(&fastAttempts), 20, 5)
-	assertWithinRangeOf(t, atomic.LoadInt32(&slowAttempts), 0, 5)
-
-	// the fast dialer suddenly becomes much slower
-	atomic.StoreInt32(&fastAttempts, 0)
-	atomic.StoreInt32(&slowAttempts, 0)
-	atomic.StoreInt64(&fastSleepFor, int64(time.Second))
-	for i := 0; i < 20; i++ {
-		_, err := bal.Dial("tcp", addr)
-		assert.NoError(t, err, fmt.Sprintf("Dialing should have succeeded in round %d", i))
-	}
-	assert.True(t, bal.nextTimeout.Get() < time.Second)
-	assertWithinRangeOf(t, atomic.LoadInt32(&fastAttempts), 0, 5)
-	assertWithinRangeOf(t, atomic.LoadInt32(&slowAttempts), 20, 5)
 }
 
 func newDialer(id int) *Dialer {
@@ -366,4 +301,8 @@ func doTestConn(t *testing.T, conn net.Conn) {
 	wg.Wait()
 	err := conn.Close()
 	assert.NoError(t, err, "Should close conn")
+}
+
+func newBalancer(strategy Strategy, dialers ...*Dialer) *Balancer {
+	return New(&Opts{Strategy: strategy, Dialers: dialers})
 }

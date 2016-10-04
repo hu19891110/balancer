@@ -39,7 +39,7 @@ func benchmarkWithRandomlyFail(b *testing.B, s Strategy) {
 	d1 := RandomlyFail(1)
 	d2 := RandomlyFail(10)
 	d3 := RandomlyFail(99)
-	bal := New(s, d1, d2, d3)
+	bal := newBalancer(s, d1, d2, d3)
 	runBenchmark(b, bal)
 }
 
@@ -47,7 +47,7 @@ func benchmarkWithRandomlyFailWithVariedDelay(b *testing.B, s Strategy) {
 	d1 := RandomlyFailWithVariedDelay(1, 10*time.Nanosecond, 8*time.Nanosecond)
 	d2 := RandomlyFailWithVariedDelay(10, 10*time.Nanosecond, 8*time.Nanosecond)
 	d3 := RandomlyFailWithVariedDelay(99, 10*time.Nanosecond, 8*time.Nanosecond)
-	bal := New(s, d1, d2, d3)
+	bal := newBalancer(s, d1, d2, d3)
 	runBenchmark(b, bal)
 }
 
